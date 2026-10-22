@@ -225,7 +225,7 @@ fn patch_reflow_image_sources(build_dir: &Path) -> Result<()> {
     if !html.contains(new_html) {
         if html.contains(old_html) {
             html = html.replacen(old_html, new_html, 1);
-            fs::write(&html_path, html)
+            fs::write(&html_path, &html)
                 .map_err(|e| format!("Unable to write {}: {e}", html_path.display()))?;
         } else {
             println!(
@@ -237,20 +237,42 @@ fn patch_reflow_image_sources(build_dir: &Path) -> Result<()> {
     // Greedy image placement: if an image does not fit in the remaining
     // space at the bottom of a page, shrink it to the available height rather
     // than pushing it to the next page.
-    if !html.contains("fit_single_image_to_height") {
+    if !html.contains("fit_line_images_to_height") {
         let flush_marker = "static int flush_line(fz_context *ctx, fz_html_box *box, layout_data *ld, float line_w, int align, float indent, fz_html_flow *a, fz_html_flow *b, fz_html_restarter *restart)";
-        let helper = "static int fit_single_image_to_height(fz_html_flow *a, fz_html_flow *b, float max_h, float *width)\n{\n\tfz_html_flow *node;\n\tint images = 0;\n\tint others = 0;\n\tfz_html_flow *image = NULL;\n\n\tif (max_h <= 0)\n\t\treturn 0;\n\tfor (node = a; node && node != b; node = node->next)\n\t{\n\t\tif (node->type == FLOW_IMAGE)\n\t\t{\n\t\t\timages++;\n\t\t\timage = node;\n\t\t}\n\t\telse if (node->type != FLOW_BREAK && node->type != FLOW_SBREAK &&\n\t\t\tnode->type != FLOW_ANCHOR)\n\t\t{\n\t\t\tothers++;\n\t\t}\n\t}\n\tif (images != 1 || others != 0 || !image || image->h <= max_h)\n\t\treturn 0;\n\n\tfloat scale = max_h / image->h;\n\timage->h *= scale;\n\timage->w *= scale;\n\t*width = image->w;\n\treturn 1;\n}\n\n";
+        let helper = "static int fit_line_images_to_height(fz_html_flow *a, fz_html_flow *b, float max_h, float *width)\n{\n\tfz_html_flow *node;\n\tfz_html_flow *tallest = NULL;\n\tint images = 0;\n\n\tif (max_h <= 0)\n\t\treturn 0;\n\tfor (node = a; node && node != b; node = node->next)\n\t{\n\t\tif (node->type == FLOW_IMAGE)\n\t\t{\n\t\t\timages++;\n\t\t\tif (!tallest || node->h > tallest->h)\n\t\t\t\ttallest = node;\n\t\t}\n\t}\n\tif (images == 0 || !tallest || tallest->h <= max_h)\n\t\treturn 0;\n\n\tfloat scale = max_h / tallest->h;\n\tfor (node = a; node && node != b; node = node->next)\n\t{\n\t\tif (node->type == FLOW_IMAGE)\n\t\t{\n\t\t\tnode->h *= scale;\n\t\t\tnode->w *= scale;\n\t\t}\n\t}\n\t*width = tallest->w;\n\treturn 1;\n}\n\n";
         if html.contains(flush_marker) {
             html = html.replace(flush_marker, &format!("{helper}{flush_marker}"));
         }
         let old = "\t\tavail = page_h - fmodf(box->s.layout.b - page_top, page_h);\n\t\t/* If the line is larger than the available space skip to the start\n\t\t * of the next page. */\n\t\tif (line_h > avail)\n\t\t{";
-        let new = "\t\tavail = page_h - fmodf(box->s.layout.b - page_top, page_h);\n\t\tif (line_h > avail)\n\t\t{\n\t\t\tfloat fitted_w;\n\t\t\tif (fit_single_image_to_height(a, b, avail, &fitted_w))\n\t\t\t{\n\t\t\t\tline_w = fitted_w;\n\t\t\t\tline_h = measure_line(a, b, &baseline);\n\t\t\t}\n\t\t}\n\t\t/* If the line is larger than the available space skip to the start\n\t\t * of the next page. */\n\t\tif (line_h > avail)\n\t\t{";
+        let new = "\t\tavail = page_h - fmodf(box->s.layout.b - page_top, page_h);\n\t\tif (line_h > avail)\n\t\t{\n\t\t\tfloat fitted_w;\n\t\t\tif (fit_line_images_to_height(a, b, avail, &fitted_w))\n\t\t\t{\n\t\t\t\tline_w = fitted_w;\n\t\t\t\tline_h = measure_line(a, b, &baseline);\n\t\t\t}\n\t\t}\n\t\t/* If the line is larger than the available space skip to the start\n\t\t * of the next page. */\n\t\tif (line_h > avail)\n\t\t{";
         if html.contains(old) {
             html = html.replacen(old, new, 1);
-            fs::write(&html_path, html)
+            fs::write(&html_path, &html)
                 .map_err(|e| format!("Unable to write {}: {e}", html_path.display()))?;
         }
     }
+
+    // Normal paragraph images must participate in the text flow. MuPDF's
+    // default HTML/FB2 styles make images block-level, which forces a page
+    // break and leaves a large gap at the bottom of the previous page. Making
+    // images inline lets the following text fill that page and keeps image
+    // lines eligible for the greedy fit above.
+    let parse_path = build_dir.join("source/html/html-parse.c");
+    let mut parse = fs::read_to_string(&parse_path)
+        .map_err(|e| format!("Unable to read {}: {e}", parse_path.display()))?;
+    let old_html_parse = "\"strong{font-weight:bold}\"\n\"style{display:none}\"";
+    let new_html_parse =
+        "\"strong{font-weight:bold}\"\n\"image{display:inline}\"\n\"style{display:none}\"";
+    if !parse.contains(new_html_parse) && parse.contains(old_html_parse) {
+        parse = parse.replacen(old_html_parse, new_html_parse, 1);
+    }
+    let old_fb2_parse = "\"image{display:block}\"";
+    let new_fb2_parse = "\"image{display:inline}\"";
+    if parse.contains(old_fb2_parse) {
+        parse = parse.replacen(old_fb2_parse, new_fb2_parse, 1);
+    }
+    fs::write(&parse_path, parse)
+        .map_err(|e| format!("Unable to write {}: {e}", parse_path.display()))?;
 
     let reflow_path = build_dir.join("source/reflow/reflow-doc.c");
     let mut reflow = fs::read_to_string(&reflow_path)
