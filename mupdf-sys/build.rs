@@ -234,17 +234,18 @@ fn patch_reflow_image_sources(build_dir: &Path) -> Result<()> {
         }
     }
 
-    // Greedy image placement: if an image does not fit in the remaining
-    // space at the bottom of a page, shrink it to the available height rather
-    // than pushing it to the next page.
+    // Image placement: decide dynamically whether an image line should be
+    // shrunk into the remaining page area or moved to the next page. The
+    // helper uses a golden-ratio comparison between the scaled image area and
+    // the whitespace that would remain.
     if !html.contains("fit_line_images_to_height") {
         let flush_marker = "static int flush_line(fz_context *ctx, fz_html_box *box, layout_data *ld, float line_w, int align, float indent, fz_html_flow *a, fz_html_flow *b, fz_html_restarter *restart)";
-        let helper = "static int fit_line_images_to_height(fz_html_flow *a, fz_html_flow *b, float max_h, float *width)\n{\n\tfz_html_flow *node;\n\tfz_html_flow *tallest = NULL;\n\tint images = 0;\n\n\tif (max_h <= 0)\n\t\treturn 0;\n\tfor (node = a; node && node != b; node = node->next)\n\t{\n\t\tif (node->type == FLOW_IMAGE)\n\t\t{\n\t\t\timages++;\n\t\t\tif (!tallest || node->h > tallest->h)\n\t\t\t\ttallest = node;\n\t\t}\n\t}\n\tif (images == 0 || !tallest || tallest->h <= max_h)\n\t\treturn 0;\n\n\tfloat scale = max_h / tallest->h;\n\tfor (node = a; node && node != b; node = node->next)\n\t{\n\t\tif (node->type == FLOW_IMAGE)\n\t\t{\n\t\t\tnode->h *= scale;\n\t\t\tnode->w *= scale;\n\t\t}\n\t}\n\t*width = tallest->w;\n\treturn 1;\n}\n\n";
+        let helper = "static int fit_line_images_to_height(fz_html_flow *a, fz_html_flow *b, float max_h, float page_w, float *width)\n{\n\tfz_html_flow *node;\n\tfz_html_flow *tallest = NULL;\n\tfloat image_area = 0;\n\tint images = 0;\n\n\tif (max_h <= 0 || page_w <= 0)\n\t\treturn 0;\n\tfor (node = a; node && node != b; node = node->next)\n\t{\n\t\tif (node->type == FLOW_IMAGE)\n\t\t{\n\t\t\timages++;\n\t\t\timage_area += node->w * node->h;\n\t\t\tif (!tallest || node->h > tallest->h)\n\t\t\t\ttallest = node;\n\t\t}\n\t}\n\tif (images == 0 || !tallest || tallest->h <= max_h)\n\t\treturn 0;\n\n\t/* Decide between shrinking the image into the remaining page area and\n\t * moving it to the next page. The image and the whitespace left beside\n\t * it should form a golden-ratio division of that area:\n\t *\n\t *     image_area / (available_area - image_area) >= phi\n\t *\n\t * Equivalently, the image must occupy at least 1/phi of the available\n\t * area. If it would be smaller, leaving the gap is the better choice. */\n\tfloat scale = max_h / tallest->h;\n\tfloat available_area = page_w * max_h;\n\tfloat scaled_area = image_area * scale * scale;\n\tif (scaled_area * 1.6180339887498948482f < available_area)\n\t\treturn 0;\n\n\tfor (node = a; node && node != b; node = node->next)\n\t{\n\t\tif (node->type == FLOW_IMAGE)\n\t\t{\n\t\t\tnode->h *= scale;\n\t\t\tnode->w *= scale;\n\t\t}\n\t}\n\t*width = tallest->w;\n\treturn 1;\n}\n\n";
         if html.contains(flush_marker) {
             html = html.replace(flush_marker, &format!("{helper}{flush_marker}"));
         }
         let old = "\t\tavail = page_h - fmodf(box->s.layout.b - page_top, page_h);\n\t\t/* If the line is larger than the available space skip to the start\n\t\t * of the next page. */\n\t\tif (line_h > avail)\n\t\t{";
-        let new = "\t\tavail = page_h - fmodf(box->s.layout.b - page_top, page_h);\n\t\tif (line_h > avail)\n\t\t{\n\t\t\tfloat fitted_w;\n\t\t\tif (fit_line_images_to_height(a, b, avail, &fitted_w))\n\t\t\t{\n\t\t\t\tline_w = fitted_w;\n\t\t\t\tline_h = measure_line(a, b, &baseline);\n\t\t\t}\n\t\t}\n\t\t/* If the line is larger than the available space skip to the start\n\t\t * of the next page. */\n\t\tif (line_h > avail)\n\t\t{";
+        let new = "\t\tavail = page_h - fmodf(box->s.layout.b - page_top, page_h);\n\t\tif (line_h > avail)\n\t\t{\n\t\t\tfloat fitted_w;\n\t\t\tif (fit_line_images_to_height(a, b, avail, page_w, &fitted_w))\n\t\t\t{\n\t\t\t\tline_w = fitted_w;\n\t\t\t\tline_h = measure_line(a, b, &baseline);\n\t\t\t}\n\t\t}\n\t\t/* If the line is larger than the available space skip to the start\n\t\t * of the next page. */\n\t\tif (line_h > avail)\n\t\t{";
         if html.contains(old) {
             html = html.replacen(old, new, 1);
             fs::write(&html_path, &html)
