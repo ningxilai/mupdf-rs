@@ -177,6 +177,8 @@ fn patch_mupdf_sources(build_dir: &Path) -> Result<()> {
 
     fs::write(&path, source).map_err(|e| format!("Unable to write {}: {e}", path.display()))?;
 
+    patch_reflow_image_sources(build_dir)?;
+
     // fz_filter_store (used by pdf_empty_store when a document is dropped)
     // releases the values of removed items by decrementing their refcount
     // directly instead of going through fz_drop_key_storable. For key storable
@@ -206,6 +208,83 @@ fn patch_mupdf_sources(build_dir: &Path) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn patch_reflow_image_sources(build_dir: &Path) -> Result<()> {
+    // MuPDF 1.27.2's reflow layout passes a zero page height into the inner
+    // HTML layout and measures image limits from content-inflated bounds. A
+    // tall image (for example 556x869 on a 612x792 page) is therefore laid
+    // out at full height and split across two pages. Use the page box height
+    // and account for the page top inset so the image shrinks to one page.
+    let html_path = build_dir.join("source/html/html-layout.c");
+    let mut html = fs::read_to_string(&html_path)
+        .map_err(|e| format!("Unable to read {}: {e}", html_path.display()))?;
+    let old_html = "			float page_h = ld->bounds[B] - ld->bounds[T];\n\n			max_w = ld->bounds[R] - ld->bounds[L];\n			max_h = page_h;";
+    let new_html = "			float page_h = ld->page[B] - ld->page[T];\n			float page_top = ld->page[T];\n			float top_inset = ld->bounds[T] - page_top;\n			if (page_h <= 0)\n				page_h = 792;\n			if (top_inset < 0 || top_inset > page_h)\n				top_inset = 0;\n\n			max_w = ld->bounds[R] - ld->bounds[L];\n			max_h = page_h - top_inset;";
+    if !html.contains(new_html) {
+        if html.contains(old_html) {
+            html = html.replacen(old_html, new_html, 1);
+            fs::write(&html_path, &html)
+                .map_err(|e| format!("Unable to write {}: {e}", html_path.display()))?;
+        } else {
+            println!(
+                "cargo:warning=Unable to patch MuPDF reflow image bounds; source snippet not found"
+            );
+        }
+    }
+
+    // Image placement: decide dynamically whether an image line should be
+    // shrunk into the remaining page area or moved to the next page. The
+    // helper uses a golden-ratio comparison between the scaled image area and
+    // the whitespace that would remain.
+    if !html.contains("fit_line_images_to_height") {
+        let flush_marker = "static int flush_line(fz_context *ctx, fz_html_box *box, layout_data *ld, float line_w, int align, float indent, fz_html_flow *a, fz_html_flow *b, fz_html_restarter *restart)";
+        let helper = "static int fit_line_images_to_height(fz_html_flow *a, fz_html_flow *b, float max_h, float page_w, float *width)\n{\n\tfz_html_flow *node;\n\tfz_html_flow *tallest = NULL;\n\tfloat image_area = 0;\n\tint images = 0;\n\n\tif (max_h <= 0 || page_w <= 0)\n\t\treturn 0;\n\tfor (node = a; node && node != b; node = node->next)\n\t{\n\t\tif (node->type == FLOW_IMAGE)\n\t\t{\n\t\t\timages++;\n\t\t\timage_area += node->w * node->h;\n\t\t\tif (!tallest || node->h > tallest->h)\n\t\t\t\ttallest = node;\n\t\t}\n\t}\n\tif (images == 0 || !tallest || tallest->h <= max_h)\n\t\treturn 0;\n\n\t/* Decide between shrinking the image into the remaining page area and\n\t * moving it to the next page. The image and the whitespace left beside\n\t * it should form a golden-ratio division of that area:\n\t *\n\t *     image_area / (available_area - image_area) >= phi\n\t *\n\t * Equivalently, the image must occupy at least 1/phi of the available\n\t * area. If it would be smaller, leaving the gap is the better choice. */\n\tfloat scale = max_h / tallest->h;\n\tfloat available_area = page_w * max_h;\n\tfloat scaled_area = image_area * scale * scale;\n\tif (scaled_area * 1.6180339887498948482f < available_area)\n\t\treturn 0;\n\n\tfor (node = a; node && node != b; node = node->next)\n\t{\n\t\tif (node->type == FLOW_IMAGE)\n\t\t{\n\t\t\tnode->h *= scale;\n\t\t\tnode->w *= scale;\n\t\t}\n\t}\n\t*width = tallest->w;\n\treturn 1;\n}\n\n";
+        if html.contains(flush_marker) {
+            html = html.replace(flush_marker, &format!("{helper}{flush_marker}"));
+        }
+        let old = "\t\tavail = page_h - fmodf(box->s.layout.b - page_top, page_h);\n\t\t/* If the line is larger than the available space skip to the start\n\t\t * of the next page. */\n\t\tif (line_h > avail)\n\t\t{";
+        let new = "\t\tavail = page_h - fmodf(box->s.layout.b - page_top, page_h);\n\t\tif (line_h > avail)\n\t\t{\n\t\t\tfloat fitted_w;\n\t\t\tif (fit_line_images_to_height(a, b, avail, page_w, &fitted_w))\n\t\t\t{\n\t\t\t\tline_w = fitted_w;\n\t\t\t\tline_h = measure_line(a, b, &baseline);\n\t\t\t}\n\t\t}\n\t\t/* If the line is larger than the available space skip to the start\n\t\t * of the next page. */\n\t\tif (line_h > avail)\n\t\t{";
+        if html.contains(old) {
+            html = html.replacen(old, new, 1);
+            fs::write(&html_path, &html)
+                .map_err(|e| format!("Unable to write {}: {e}", html_path.display()))?;
+        }
+    }
+
+    // Normal paragraph images must participate in the text flow. MuPDF's
+    // default HTML/FB2 styles make images block-level, which forces a page
+    // break and leaves a large gap at the bottom of the previous page. Making
+    // images inline lets the following text fill that page and keeps image
+    // lines eligible for the greedy fit above.
+    let parse_path = build_dir.join("source/html/html-parse.c");
+    let mut parse = fs::read_to_string(&parse_path)
+        .map_err(|e| format!("Unable to read {}: {e}", parse_path.display()))?;
+    let old_html_parse = "\"strong{font-weight:bold}\"\n\"style{display:none}\"";
+    let new_html_parse =
+        "\"strong{font-weight:bold}\"\n\"image{display:inline}\"\n\"style{display:none}\"";
+    if !parse.contains(new_html_parse) && parse.contains(old_html_parse) {
+        parse = parse.replacen(old_html_parse, new_html_parse, 1);
+    }
+    let old_fb2_parse = "\"image{display:block}\"";
+    let new_fb2_parse = "\"image{display:inline}\"";
+    if parse.contains(old_fb2_parse) {
+        parse = parse.replacen(old_fb2_parse, new_fb2_parse, 1);
+    }
+    fs::write(&parse_path, parse)
+        .map_err(|e| format!("Unable to write {}: {e}", parse_path.display()))?;
+
+    let reflow_path = build_dir.join("source/reflow/reflow-doc.c");
+    let mut reflow = fs::read_to_string(&reflow_path)
+        .map_err(|e| format!("Unable to read {}: {e}", reflow_path.display()))?;
+    let old_reflow = "fz_layout_document(ctx, page->html_doc, doc->w, 0, doc->em);";
+    let new_reflow = "fz_layout_document(ctx, page->html_doc, doc->w, doc->h, doc->em);";
+    if reflow.contains(old_reflow) {
+        reflow = reflow.replace(old_reflow, new_reflow);
+        fs::write(&reflow_path, reflow)
+            .map_err(|e| format!("Unable to write {}: {e}", reflow_path.display()))?;
+    }
     Ok(())
 }
 
