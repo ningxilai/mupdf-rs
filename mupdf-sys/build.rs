@@ -212,16 +212,17 @@ fn patch_mupdf_sources(build_dir: &Path) -> Result<()> {
 }
 
 fn patch_reflow_image_sources(build_dir: &Path) -> Result<()> {
-    // MuPDF 1.27.2's reflow layout passes a zero page height into the inner
-    // HTML layout and measures image limits from content-inflated bounds. A
-    // tall image (for example 556x869 on a 612x792 page) is therefore laid
-    // out at full height and split across two pages. Use the page box height
-    // and account for the page top inset so the image shrinks to one page.
+    // MuPDF 1.27.2's reflow layout measures the image height limit from the
+    // current block's bounds. That is the space from the block's top to the
+    // bottom of the block, not the page, so an image partway down a page is
+    // shrunk to the few lines that happen to remain above it. Use the page
+    // box instead: the image may occupy a whole page, and flush_line decides
+    // later whether shrinking it into the remaining space is worthwhile.
     let html_path = build_dir.join("source/html/html-layout.c");
     let mut html = fs::read_to_string(&html_path)
         .map_err(|e| format!("Unable to read {}: {e}", html_path.display()))?;
     let old_html = "			float page_h = ld->bounds[B] - ld->bounds[T];\n\n			max_w = ld->bounds[R] - ld->bounds[L];\n			max_h = page_h;";
-    let new_html = "			float page_h = ld->page[B] - ld->page[T];\n			float page_top = ld->page[T];\n			float top_inset = ld->bounds[T] - page_top;\n			if (page_h <= 0)\n				page_h = 792;\n			if (top_inset < 0 || top_inset > page_h)\n				top_inset = 0;\n\n			max_w = ld->bounds[R] - ld->bounds[L];\n			max_h = page_h - top_inset;";
+    let new_html = "			float page_h = ld->page[B] - ld->page[T];\n\n			max_w = ld->bounds[R] - ld->bounds[L];\n			max_h = page_h;";
     if !html.contains(new_html) {
         if html.contains(old_html) {
             html = html.replacen(old_html, new_html, 1);
@@ -235,17 +236,126 @@ fn patch_reflow_image_sources(build_dir: &Path) -> Result<()> {
     }
 
     // Image placement: decide dynamically whether an image line should be
-    // shrunk into the remaining page area or moved to the next page. The
-    // helper uses a golden-ratio comparison between the scaled image area and
-    // the whitespace that would remain.
+    // shrunk into the remaining page area or moved to the next page.
+    //
+    // A landscape image may only be shrunk when the result still spans a
+    // golden-ratio share of the text width; a portrait image may only be
+    // shrunk when the remaining height is a golden-ratio share of the page
+    // height. Otherwise the line moves to the next page, where the images fit
+    // at their normal size instead of becoming a tiny strip at the bottom of
+    // the page.
     if !html.contains("fit_line_images_to_height") {
         let flush_marker = "static int flush_line(fz_context *ctx, fz_html_box *box, layout_data *ld, float line_w, int align, float indent, fz_html_flow *a, fz_html_flow *b, fz_html_restarter *restart)";
-        let helper = "static int fit_line_images_to_height(fz_html_flow *a, fz_html_flow *b, float max_h, float page_w, float *width)\n{\n\tfz_html_flow *node;\n\tfz_html_flow *tallest = NULL;\n\tfloat image_area = 0;\n\tint images = 0;\n\n\tif (max_h <= 0 || page_w <= 0)\n\t\treturn 0;\n\tfor (node = a; node && node != b; node = node->next)\n\t{\n\t\tif (node->type == FLOW_IMAGE)\n\t\t{\n\t\t\timages++;\n\t\t\timage_area += node->w * node->h;\n\t\t\tif (!tallest || node->h > tallest->h)\n\t\t\t\ttallest = node;\n\t\t}\n\t}\n\tif (images == 0 || !tallest || tallest->h <= max_h)\n\t\treturn 0;\n\n\t/* Decide between shrinking the image into the remaining page area and\n\t * moving it to the next page. The image and the whitespace left beside\n\t * it should form a golden-ratio division of that area:\n\t *\n\t *     image_area / (available_area - image_area) >= phi\n\t *\n\t * Equivalently, the image must occupy at least 1/phi of the available\n\t * area. If it would be smaller, leaving the gap is the better choice. */\n\tfloat scale = max_h / tallest->h;\n\tfloat available_area = page_w * max_h;\n\tfloat scaled_area = image_area * scale * scale;\n\tif (scaled_area * 1.6180339887498948482f < available_area)\n\t\treturn 0;\n\n\tfor (node = a; node && node != b; node = node->next)\n\t{\n\t\tif (node->type == FLOW_IMAGE)\n\t\t{\n\t\t\tnode->h *= scale;\n\t\t\tnode->w *= scale;\n\t\t}\n\t}\n\t*width = tallest->w;\n\treturn 1;\n}\n\n";
+        let helper = r#"#define REFLOW_IMAGE_PHI 0.6180339887498948482f
+
+static float measure_line_width(fz_html_flow *a, fz_html_flow *b)
+{
+	fz_html_flow *node;
+	float width = 0;
+
+	for (node = a; node && node != b; node = node->next)
+	{
+		if (node->type == FLOW_BREAK || node->type == FLOW_SBREAK || node->type == FLOW_ANCHOR)
+			continue;
+		if (node->type == FLOW_SPACE && node->breaks_line)
+			continue;
+		if (node->type == FLOW_SHYPHEN && !node->breaks_line)
+			continue;
+		width += node->w;
+	}
+	return width;
+}
+
+static float measure_line_text_height(fz_html_flow *a, fz_html_flow *b)
+{
+	fz_html_flow *node;
+	float height = 0;
+
+	for (node = a; node && node != b; node = node->next)
+	{
+		if (node->type == FLOW_IMAGE)
+			continue;
+		if (node->h > height)
+			height = node->h;
+	}
+	return height;
+}
+
+static int fit_line_images_to_height(fz_html_flow *a, fz_html_flow *b, float avail, float page_w, float page_h, float *width)
+{
+	fz_html_flow *node;
+	int has_landscape = 0;
+	int resized = 0;
+	float projected_w;
+
+	if (avail <= 0 || page_w <= 0 || page_h <= 0)
+		return 0;
+
+	/* If the text on the line does not fit, shrinking images cannot help. */
+	if (measure_line_text_height(a, b) > avail)
+		return 0;
+
+	/* Decide whether the images are still prominent enough after shrinking
+	 * them to the remaining height. This is checked before any image is
+	 * modified so that a rejected line keeps its original size when it is
+	 * moved to the next page.
+	 *
+	 * Landscape images are judged by the width all images on the line still
+	 * occupy. Several images sharing a line may each be narrower than the
+	 * threshold while together filling most of the text width, so counting
+	 * them individually would reject an otherwise good line. */
+	projected_w = 0;
+	for (node = a; node && node != b; node = node->next)
+	{
+		if (node->type == FLOW_IMAGE)
+			projected_w += node->w;
+	}
+	for (node = a; node && node != b; node = node->next)
+	{
+		float scale;
+
+		if (node->type != FLOW_IMAGE || node->h <= avail)
+			continue;
+		scale = avail / node->h;
+		projected_w -= node->w - node->w * scale;
+		if (node->w >= node->h)
+			has_landscape = 1;
+		else if (avail < page_h * REFLOW_IMAGE_PHI)
+		{
+			/* Portrait: shrinking it to a small strip at the bottom of the
+			 * page is worse than moving it to the next page. */
+			return 0;
+		}
+		resized = 1;
+	}
+	if (!resized)
+		return 0;
+	if (has_landscape && projected_w < page_w * REFLOW_IMAGE_PHI)
+		return 0;
+
+	/* Cap only the images that do not fit. Scaling the whole line by the
+	 * tallest image would needlessly shrink shorter images that already fit,
+	 * which is especially visible when several images share a line. */
+	for (node = a; node && node != b; node = node->next)
+	{
+		if (node->type == FLOW_IMAGE && node->h > avail)
+		{
+			float scale = avail / node->h;
+			node->w *= scale;
+			node->h = avail;
+		}
+	}
+
+	*width = measure_line_width(a, b);
+	return 1;
+}
+
+"#;
         if html.contains(flush_marker) {
             html = html.replace(flush_marker, &format!("{helper}{flush_marker}"));
         }
         let old = "\t\tavail = page_h - fmodf(box->s.layout.b - page_top, page_h);\n\t\t/* If the line is larger than the available space skip to the start\n\t\t * of the next page. */\n\t\tif (line_h > avail)\n\t\t{";
-        let new = "\t\tavail = page_h - fmodf(box->s.layout.b - page_top, page_h);\n\t\tif (line_h > avail)\n\t\t{\n\t\t\tfloat fitted_w;\n\t\t\tif (fit_line_images_to_height(a, b, avail, page_w, &fitted_w))\n\t\t\t{\n\t\t\t\tline_w = fitted_w;\n\t\t\t\tline_h = measure_line(a, b, &baseline);\n\t\t\t}\n\t\t}\n\t\t/* If the line is larger than the available space skip to the start\n\t\t * of the next page. */\n\t\tif (line_h > avail)\n\t\t{";
+        let new = "\t\tavail = page_h - fmodf(box->s.layout.b - page_top, page_h);\n\t\tif (line_h > avail)\n\t\t{\n\t\t\tfloat fitted_w;\n\t\t\tif (fit_line_images_to_height(a, b, avail, page_w, page_h, &fitted_w))\n\t\t\t{\n\t\t\t\tline_w = fitted_w;\n\t\t\t\tline_h = measure_line(a, b, &baseline);\n\t\t\t}\n\t\t}\n\t\t/* If the line is larger than the available space skip to the start\n\t\t * of the next page. */\n\t\tif (line_h > avail)\n\t\t{";
         if html.contains(old) {
             html = html.replacen(old, new, 1);
             fs::write(&html_path, &html)
