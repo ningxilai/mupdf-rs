@@ -216,8 +216,8 @@ fn patch_reflow_image_sources(build_dir: &Path) -> Result<()> {
     // current block's bounds. That is the space from the block's top to the
     // bottom of the block, not the page, so an image partway down a page is
     // shrunk to the few lines that happen to remain above it. Use the page
-    // box instead: the image may occupy a whole page, and flush_line decides
-    // later whether shrinking it into the remaining space is worthwhile.
+    // box instead: an image is measured against a whole page and is moved to
+    // the next page when it does not fit the current one.
     let html_path = build_dir.join("source/html/html-layout.c");
     let mut html = fs::read_to_string(&html_path)
         .map_err(|e| format!("Unable to read {}: {e}", html_path.display()))?;
@@ -235,139 +235,21 @@ fn patch_reflow_image_sources(build_dir: &Path) -> Result<()> {
         }
     }
 
-    // Image placement: decide dynamically whether an image line should be
-    // shrunk into the remaining page area or moved to the next page.
-    //
-    // A landscape image may only be shrunk when the result still spans a
-    // golden-ratio share of the text width; a portrait image may only be
-    // shrunk when the remaining height is a golden-ratio share of the page
-    // height. Otherwise the line moves to the next page, where the images fit
-    // at their normal size instead of becoming a tiny strip at the bottom of
-    // the page.
-    if !html.contains("fit_line_images_to_height") {
-        let flush_marker = "static int flush_line(fz_context *ctx, fz_html_box *box, layout_data *ld, float line_w, int align, float indent, fz_html_flow *a, fz_html_flow *b, fz_html_restarter *restart)";
-        let helper = r#"#define REFLOW_IMAGE_PHI 0.6180339887498948482f
-
-static float measure_line_width(fz_html_flow *a, fz_html_flow *b)
-{
-	fz_html_flow *node;
-	float width = 0;
-
-	for (node = a; node && node != b; node = node->next)
-	{
-		if (node->type == FLOW_BREAK || node->type == FLOW_SBREAK || node->type == FLOW_ANCHOR)
-			continue;
-		if (node->type == FLOW_SPACE && node->breaks_line)
-			continue;
-		if (node->type == FLOW_SHYPHEN && !node->breaks_line)
-			continue;
-		width += node->w;
-	}
-	return width;
-}
-
-static float measure_line_text_height(fz_html_flow *a, fz_html_flow *b)
-{
-	fz_html_flow *node;
-	float height = 0;
-
-	for (node = a; node && node != b; node = node->next)
-	{
-		if (node->type == FLOW_IMAGE)
-			continue;
-		if (node->h > height)
-			height = node->h;
-	}
-	return height;
-}
-
-static int fit_line_images_to_height(fz_html_flow *a, fz_html_flow *b, float avail, float page_w, float page_h, float *width)
-{
-	fz_html_flow *node;
-	int has_landscape = 0;
-	int resized = 0;
-	float projected_w;
-
-	if (avail <= 0 || page_w <= 0 || page_h <= 0)
-		return 0;
-
-	/* If the text on the line does not fit, shrinking images cannot help. */
-	if (measure_line_text_height(a, b) > avail)
-		return 0;
-
-	/* Decide whether the images are still prominent enough after shrinking
-	 * them to the remaining height. This is checked before any image is
-	 * modified so that a rejected line keeps its original size when it is
-	 * moved to the next page.
-	 *
-	 * Landscape images are judged by the width all images on the line still
-	 * occupy. Several images sharing a line may each be narrower than the
-	 * threshold while together filling most of the text width, so counting
-	 * them individually would reject an otherwise good line. */
-	projected_w = 0;
-	for (node = a; node && node != b; node = node->next)
-	{
-		if (node->type == FLOW_IMAGE)
-			projected_w += node->w;
-	}
-	for (node = a; node && node != b; node = node->next)
-	{
-		float scale;
-
-		if (node->type != FLOW_IMAGE || node->h <= avail)
-			continue;
-		scale = avail / node->h;
-		projected_w -= node->w - node->w * scale;
-		if (node->w >= node->h)
-			has_landscape = 1;
-		else if (avail < page_h * REFLOW_IMAGE_PHI)
-		{
-			/* Portrait: shrinking it to a small strip at the bottom of the
-			 * page is worse than moving it to the next page. */
-			return 0;
-		}
-		resized = 1;
-	}
-	if (!resized)
-		return 0;
-	if (has_landscape && projected_w < page_w * REFLOW_IMAGE_PHI)
-		return 0;
-
-	/* Cap only the images that do not fit. Scaling the whole line by the
-	 * tallest image would needlessly shrink shorter images that already fit,
-	 * which is especially visible when several images share a line. */
-	for (node = a; node && node != b; node = node->next)
-	{
-		if (node->type == FLOW_IMAGE && node->h > avail)
-		{
-			float scale = avail / node->h;
-			node->w *= scale;
-			node->h = avail;
-		}
-	}
-
-	*width = measure_line_width(a, b);
-	return 1;
-}
-
-"#;
-        if html.contains(flush_marker) {
-            html = html.replace(flush_marker, &format!("{helper}{flush_marker}"));
-        }
-        let old = "\t\tavail = page_h - fmodf(box->s.layout.b - page_top, page_h);\n\t\t/* If the line is larger than the available space skip to the start\n\t\t * of the next page. */\n\t\tif (line_h > avail)\n\t\t{";
-        let new = "\t\tavail = page_h - fmodf(box->s.layout.b - page_top, page_h);\n\t\tif (line_h > avail)\n\t\t{\n\t\t\tfloat fitted_w;\n\t\t\tif (fit_line_images_to_height(a, b, avail, page_w, page_h, &fitted_w))\n\t\t\t{\n\t\t\t\tline_w = fitted_w;\n\t\t\t\tline_h = measure_line(a, b, &baseline);\n\t\t\t}\n\t\t}\n\t\t/* If the line is larger than the available space skip to the start\n\t\t * of the next page. */\n\t\tif (line_h > avail)\n\t\t{";
-        if html.contains(old) {
-            html = html.replacen(old, new, 1);
-            fs::write(&html_path, &html)
-                .map_err(|e| format!("Unable to write {}: {e}", html_path.display()))?;
-        }
-    }
+    // Images are atomic boxes. The measurement above caps each image to the
+    // text column and the page box, so an image that does not fit the space
+    // left on the current page is moved to the next page at that same size.
+    // Shrinking only the overflowing line, as the previous patch did, made two
+    // adjacent images land on different pages at different scales: in a spread
+    // one looked large and the other small, and the roll re-scaled one of them
+    // as it slid into view. LaTeX, Typst, and SILE all treat an image as a box
+    // and move it rather than shrinking it into the remaining page space,
+    // which also preserves the relative size of images in a run.
 
     // Normal paragraph images must participate in the text flow. MuPDF's
     // default HTML/FB2 styles make images block-level, which forces a page
     // break and leaves a large gap at the bottom of the previous page. Making
-    // images inline lets the following text fill that page and keeps image
-    // lines eligible for the greedy fit above.
+    // images inline lets the following text fill that page and keeps the image
+    // on the same line-breaking path as the surrounding words.
     let parse_path = build_dir.join("source/html/html-parse.c");
     let mut parse = fs::read_to_string(&parse_path)
         .map_err(|e| format!("Unable to read {}: {e}", parse_path.display()))?;
